@@ -235,53 +235,126 @@ def build_speed_slice(model: Model, layer: int) -> np.ndarray:
     return model.vsf[:, :, layer]
 
 
+def _solve_eikonal(tx: float, tz: float, inv_dx2: float, inv_dz2: float, inv_speed2: float) -> float:
+    a = inv_dx2
+    b = inv_dz2
+    disc = (a * tx + b * tz) ** 2 - (a + b) * (a * tx * tx + b * tz * tz - inv_speed2)
+    if disc < 0:
+        return min(tx + math.sqrt(1.0 / inv_speed2) / math.sqrt(inv_dx2), tz + math.sqrt(1.0 / inv_speed2) / math.sqrt(inv_dz2))
+    return (a * tx + b * tz + math.sqrt(disc)) / (a + b)
+
+
 def fast_marching(speed: np.ndarray, dx: float, dz: float, source: Tuple[int, int]) -> np.ndarray:
     n1, n2 = speed.shape
     travel = np.full((n1, n2), np.inf, dtype=float)
+    status = np.zeros((n1, n2), dtype=np.int8)  # 0=far,1=trial,2=accepted
     sx, sz = source
     travel[sx, sz] = 0.0
-    heap: List[Tuple[float, int, int]] = [(0.0, sx, sz)]
-    neighbours = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    status[sx, sz] = 2
+    heap: List[Tuple[float, int, int]] = []
+
+    def update(i: int, j: int) -> None:
+        if not (0 <= i < n1 and 0 <= j < n2):
+            return
+        if status[i, j] == 2:
+            return
+        tx = np.inf
+        tz = np.inf
+        if i - 1 >= 0 and status[i - 1, j] == 2:
+            tx = min(tx, travel[i - 1, j])
+        if i + 1 < n1 and status[i + 1, j] == 2:
+            tx = min(tx, travel[i + 1, j])
+        if j - 1 >= 0 and status[i, j - 1] == 2:
+            tz = min(tz, travel[i, j - 1])
+        if j + 1 < n2 and status[i, j + 1] == 2:
+            tz = min(tz, travel[i, j + 1])
+        if np.isinf(tx) and np.isinf(tz):
+            return
+        tentative = _solve_eikonal(tx, tz, 1.0 / (dx * dx), 1.0 / (dz * dz), 1.0 / (speed[i, j] ** 2))
+        if tentative < travel[i, j]:
+            travel[i, j] = tentative
+            status[i, j] = 1
+            heapq.heappush(heap, (tentative, i, j))
+
+    for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        update(sx + di, sz + dj)
+
     while heap:
         t, i, j = heapq.heappop(heap)
         if t != travel[i, j]:
             continue
-        for di, dj in neighbours:
-            ni, nj = i + di, j + dj
-            if 0 <= ni < n1 and 0 <= nj < n2:
-                ds = dx if dj == 0 else dz
-                tentative = t + ds / speed[ni, nj]
-                if tentative < travel[ni, nj]:
-                    travel[ni, nj] = tentative
-                    heapq.heappush(heap, (tentative, ni, nj))
+        status[i, j] = 2
+        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            update(i + di, j + dj)
     return travel
 
 
-def extract_path(travel: np.ndarray, dx: float, dz: float, start: Tuple[int, int], end: Tuple[int, int]) -> RayPath:
-    i, j = end
+def _index_to_coords_rad(grid: Grid, idx: Tuple[int, int]) -> Tuple[float, float]:
+    lat_deg = grid.lat_from_i(idx[0])
+    lon_deg = grid.lon_from_j(idx[1])
+    return math.radians(90.0 - lat_deg), math.radians(lon_deg)
+
+
+def _coords_to_index(grid: Grid, colat: float, lon: float) -> Tuple[int, int]:
+    lat = 90.0 - math.degrees(colat)
+    lon_deg = math.degrees(lon)
+    return grid.index_from_latlon(lat, lon_deg)
+
+
+def extract_path(travel: np.ndarray, grid: Grid, start: Tuple[int, int], end: Tuple[int, int]) -> RayPath:
+    colat, lon = _index_to_coords_rad(grid, end)
+    src_colat, src_lon = _index_to_coords_rad(grid, start)
+    dlat = math.radians(grid.dvxd)
+    dlon = math.radians(grid.dvzd)
+    dpl = 0.5 * EARTH_RADIUS_KM * min(dlat, dlon * max(math.sin(colat), 1e-6))
+
     cells: List[Tuple[int, int]] = []
     lengths: List[float] = []
-    neighbours = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    while (i, j) != start:
+    max_steps = travel.shape[0] * travel.shape[1]
+    i, j = end
+
+    for _ in range(max_steps):
         cells.append((i, j))
-        best_time = travel[i, j]
-        best_cell = (i, j)
-        best_len = 0.0
-        for di, dj in neighbours:
-            ni, nj = i + di, j + dj
-            if 0 <= ni < travel.shape[0] and 0 <= nj < travel.shape[1]:
-                cand = travel[ni, nj]
-                if cand < best_time:
-                    best_time = cand
-                    best_cell = (ni, nj)
-                    best_len = dx if dj == 0 else dz
-        if best_cell == (i, j):
+        # finite-difference gradient
+        if 0 < i < travel.shape[0] - 1:
+            dtx = (travel[i + 1, j] - travel[i - 1, j]) / (2.0 * EARTH_RADIUS_KM * dlat)
+        else:
+            di = 1 if i + 1 < travel.shape[0] else -1
+            dtx = (travel[i + di, j] - travel[i, j]) / (EARTH_RADIUS_KM * dlat)
+        if 0 < j < travel.shape[1] - 1:
+            dtz = (travel[i, j + 1] - travel[i, j - 1]) / (2.0 * EARTH_RADIUS_KM * max(math.sin(colat), 1e-6) * dlon)
+        else:
+            dj = 1 if j + 1 < travel.shape[1] else -1
+            dtz = (travel[i, j + dj] - travel[i, j]) / (EARTH_RADIUS_KM * max(math.sin(colat), 1e-6) * dlon)
+
+        grad_norm = math.hypot(dtx, dtz)
+        if grad_norm == 0:
             break
-        i, j = best_cell
-        lengths.append(best_len if best_len > 0 else math.hypot(dx, dz))
-    cells.append(start)
-    lengths.append(0.0)
-    return RayPath(cells=cells[::-1], lengths=lengths[::-1])
+
+        step_colat = dpl * dtx / (EARTH_RADIUS_KM * grad_norm)
+        step_lon = dpl * dtz / (EARTH_RADIUS_KM * max(math.sin(colat), 1e-6) * grad_norm)
+        new_colat = colat - step_colat
+        new_lon = lon - step_lon
+
+        seg_len = EARTH_RADIUS_KM * math.sqrt(step_colat ** 2 + (step_lon * max(math.sin(colat), 1e-6)) ** 2)
+        lengths.append(seg_len)
+
+        colat = new_colat
+        lon = new_lon
+        i, j = _coords_to_index(grid, colat, lon)
+
+        dist_to_src = EARTH_RADIUS_KM * math.sqrt(
+            (colat - src_colat) ** 2 + (max(math.sin(colat), 1e-6) * (lon - src_lon)) ** 2
+        )
+        if dist_to_src < 2 * dpl:
+            cells.append(start)
+            lengths.append(dist_to_src)
+            break
+        if (i, j) == start:
+            cells.append(start)
+            lengths.append(seg_len)
+            break
+    return RayPath(cells=cells, lengths=lengths)
 
 
 def assemble_observations(sources: List[SourceMeasurement], distances: np.ndarray, observed_times: np.ndarray) -> ObservationSet:
@@ -338,7 +411,7 @@ def build_system(
         travel = fast_marching(speed_slice, dx_km, dz_km, (i_src, j_src))
         for rcv in src.receivers:
             i_rcv, j_rcv = grid.index_from_latlon(rcv[0], rcv[1])
-            path = extract_path(travel, dx_km, dz_km, (i_src, j_src), (i_rcv, j_rcv))
+            path = extract_path(travel, grid, (i_src, j_src), (i_rcv, j_rcv))
             dsyn[row] = path.accumulate(speed_slice)
             for (i, j), seg in zip(path.cells, path.lengths):
                 if 0 < i < grid.nx - 1 and 0 < j < grid.ny - 1:
